@@ -1,0 +1,25 @@
+# Build output
+bin/
+obj/
+publish/
+
+# User-specific
+*.user
+*.suo
+*.userosscache
+
+# VS temp
+.vs/
+*.rsuser
+
+# Debug logs
+n24debug.log
+
+# NuGet
+*.nupkg
+packages/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
