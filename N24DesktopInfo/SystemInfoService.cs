@@ -25,6 +25,7 @@ namespace N24DesktopInfo
         public string CpuName { get; set; } = "";
         public int CpuCores { get; set; }
         public double CpuUsagePercent { get; set; }
+        public List<double> CpuPerCorePercent { get; set; } = new();
         public ulong RamTotalBytes { get; set; }
         public ulong RamUsedBytes { get; set; }
         public double RamUsedPercent { get; set; }
@@ -78,6 +79,12 @@ namespace N24DesktopInfo
         private long _prevIdleTime, _prevKernelTime, _prevUserTime;
         private double _lastCpuPercent;
 
+        // CPU per-core
+        private readonly int _logicalCores = Environment.ProcessorCount;
+        private long[] _prevCoreIdle, _prevCoreKernel, _prevCoreUser;
+        private double[] _lastCorePercent;
+        private bool _coreSeeded;
+
         // Traffic: 3 independent probes
         private readonly ProbeGetIfTable _probeIfTable;
         private readonly ProbePdh _probePdh;
@@ -93,6 +100,10 @@ namespace N24DesktopInfo
             _config = config;
             _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
             NativeMethods.GetSystemTimes(out _prevIdleTime, out _prevKernelTime, out _prevUserTime);
+            _prevCoreIdle = new long[_logicalCores];
+            _prevCoreKernel = new long[_logicalCores];
+            _prevCoreUser = new long[_logicalCores];
+            _lastCorePercent = new double[_logicalCores];
             _trafficHistory = new TrafficSample[Math.Max(10, config.Traffic.ChartSeconds)];
 
             _probeIfTable = new ProbeGetIfTable();
@@ -135,6 +146,7 @@ namespace N24DesktopInfo
             };
 
             data.CpuUsagePercent = GetCpuUsage();
+            if (_config.Sections.ShowCpuPerCore) GetCpuPerCoreUsage(data);
             CollectMemory(data);
             if (_config.Sections.ShowDisks) CollectDisks(data);
             if (_config.Sections.ShowNetwork) CollectNetworkAdapters(data);
@@ -219,6 +231,49 @@ namespace N24DesktopInfo
             if (total == 0) return _lastCpuPercent;
             _lastCpuPercent = (1.0 - (double)dI / total) * 100.0;
             return _lastCpuPercent;
+        }
+
+        private void GetCpuPerCoreUsage(SystemInfoData data)
+        {
+            int n = _logicalCores;
+            int structSize = Marshal.SizeOf<NativeMethods.SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION>();
+            int bufSize = structSize * n;
+            IntPtr buf = Marshal.AllocHGlobal(bufSize);
+            try
+            {
+                int status = NativeMethods.NtQuerySystemInformation(
+                    NativeMethods.SystemProcessorPerformanceInformation, buf, bufSize, out _);
+                if (status != 0) { EmitLastCorePercents(data); return; }
+
+                for (int i = 0; i < n; i++)
+                {
+                    var info = Marshal.PtrToStructure<NativeMethods.SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION>(
+                        buf + i * structSize);
+                    long idle = info.IdleTime;
+                    long kernel = info.KernelTime; // enthält Idle
+                    long user = info.UserTime;
+
+                    long dI = idle - _prevCoreIdle[i];
+                    long dK = kernel - _prevCoreKernel[i];
+                    long dU = user - _prevCoreUser[i];
+                    _prevCoreIdle[i] = idle; _prevCoreKernel[i] = kernel; _prevCoreUser[i] = user;
+
+                    long total = dK + dU;
+                    if (_coreSeeded && total > 0)
+                        _lastCorePercent[i] = (1.0 - (double)dI / total) * 100.0;
+                }
+                _coreSeeded = true;
+                EmitLastCorePercents(data);
+            }
+            catch { EmitLastCorePercents(data); }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+
+        private void EmitLastCorePercents(SystemInfoData data)
+        {
+            data.CpuPerCorePercent.Clear();
+            for (int i = 0; i < _logicalCores; i++)
+                data.CpuPerCorePercent.Add(Math.Clamp(_lastCorePercent[i], 0, 100));
         }
 
         // ============================================================
@@ -581,13 +636,23 @@ namespace N24DesktopInfo
         private DateTime _prevTime;
         private bool _seeded;
 
+        // WS2019-Fix: Scope EINMAL verbinden (nicht jede Sekunde neu), Query mit
+        // hartem Watchdog-Timeout, und nach mehreren Timeouts Probe dauerhaft
+        // abschalten. Verhindert, dass ein hängendes WMI-Get() den Collect-Thread
+        // dauerhaft blockiert und die Anzeige einfriert.
+        private ManagementScope? _scope;
+        private int _consecutiveFailures;
+        private const int MaxConsecutiveFailures = 3;
+        private const int QueryTimeoutMs = 2000;
+
         public ProbeNdisWmi()
         {
             try
             {
-                var scope = new ManagementScope(@"\\.\root\WMI");
-                scope.Connect();
-                using var s = new ManagementObjectSearcher(scope,
+                _scope = new ManagementScope(@"\\.\root\WMI",
+                    new ConnectionOptions { Timeout = TimeSpan.FromSeconds(2) });
+                _scope.Connect();
+                using var s = new ManagementObjectSearcher(_scope,
                     new ObjectQuery("SELECT InstanceName FROM MSNdis_StatisticsInfo"));
 
                 foreach (ManagementObject o in s.Get())
@@ -606,17 +671,31 @@ namespace N24DesktopInfo
 
                 Ok = AdapterName.Length > 0;
             }
-            catch { Ok = false; }
+            catch { Ok = false; _scope = null; }
         }
 
         public void Sample(StringBuilder? log)
         {
             if (!Ok) return;
-            try
+
+            // Query in eigenem Task mit hartem Timeout ausführen. Blockiert das
+            // WMI-Get() (WS2019/Winmgmt-Hänger), kehrt Sample trotzdem zurück und
+            // die Anzeige läuft weiter. Nach MaxConsecutiveFailures wird der Probe
+            // permanent deaktiviert, damit keine weiteren Threads hängen bleiben.
+            ulong inB = 0, outB = 0;
+            bool haveValue = false;
+            Exception? queryError = null;
+
+            var queryTask = Task.Run(() =>
             {
-                var opts = new ConnectionOptions { Timeout = TimeSpan.FromSeconds(2) };
-                var scope = new ManagementScope(@"\\.\root\WMI", opts);
-                scope.Connect();
+                var scope = _scope;
+                if (scope == null || !scope.IsConnected)
+                {
+                    scope = new ManagementScope(@"\\.\root\WMI",
+                        new ConnectionOptions { Timeout = TimeSpan.FromSeconds(2) });
+                    scope.Connect();
+                    _scope = scope;
+                }
 
                 string esc = AdapterName.Replace("\\", "\\\\").Replace("'", "\\'");
                 using var s = new ManagementObjectSearcher(scope,
@@ -626,34 +705,62 @@ namespace N24DesktopInfo
 
                 foreach (ManagementObject o in s.Get())
                 {
-                    ulong inB = Convert.ToUInt64(o["ifHCInOctets"] ?? 0);
-                    ulong outB = Convert.ToUInt64(o["ifHCOutOctets"] ?? 0);
+                    inB = Convert.ToUInt64(o["ifHCInOctets"] ?? 0);
+                    outB = Convert.ToUInt64(o["ifHCOutOctets"] ?? 0);
                     o.Dispose();
-
-                    var now = DateTime.UtcNow;
-                    if (_seeded)
-                    {
-                        double elapsed = (now - _prevTime).TotalSeconds;
-                        if (elapsed > 0.05)
-                        {
-                            InBps = (inB >= _prevIn ? inB - _prevIn : 0) / elapsed;
-                            OutBps = (outB >= _prevOut ? outB - _prevOut : 0) / elapsed;
-                        }
-                    }
-                    else _seeded = true;
-
-                    _prevIn = inB; _prevOut = outB; _prevTime = now;
-
-                    log?.AppendLine($"  [NDIS-WMI] \"{AdapterName}\" " +
-                        $"total={inB:N0}/{outB:N0} " +
-                        $"IN={SystemInfoService.FormatBps(InBps)} OUT={SystemInfoService.FormatBps(OutBps)}");
+                    haveValue = true;
                     break;
                 }
-            }
-            catch (Exception ex)
+            });
+
+            bool finished;
+            try { finished = queryTask.Wait(QueryTimeoutMs); }
+            catch (AggregateException ae) { finished = true; queryError = ae.InnerException ?? ae; }
+
+            if (!finished)
             {
-                log?.AppendLine($"  [NDIS-WMI] EXCEPTION: {ex.Message}");
+                // Query hängt -> Scope verwerfen, Fehler zählen, ggf. Probe abschalten.
+                _scope = null;
+                if (++_consecutiveFailures >= MaxConsecutiveFailures)
+                {
+                    Ok = false;
+                    log?.AppendLine($"  [NDIS-WMI] DISABLED nach {_consecutiveFailures} Timeouts (WMI blockiert)");
+                }
+                else
+                {
+                    log?.AppendLine($"  [NDIS-WMI] TIMEOUT #{_consecutiveFailures} (>{QueryTimeoutMs}ms)");
+                }
+                return;
             }
+
+            if (queryError != null)
+            {
+                _scope = null;
+                if (++_consecutiveFailures >= MaxConsecutiveFailures) Ok = false;
+                log?.AppendLine($"  [NDIS-WMI] EXCEPTION: {queryError.Message}");
+                return;
+            }
+
+            _consecutiveFailures = 0;
+            if (!haveValue) return;
+
+            var now = DateTime.UtcNow;
+            if (_seeded)
+            {
+                double elapsed = (now - _prevTime).TotalSeconds;
+                if (elapsed > 0.05)
+                {
+                    InBps = (inB >= _prevIn ? inB - _prevIn : 0) / elapsed;
+                    OutBps = (outB >= _prevOut ? outB - _prevOut : 0) / elapsed;
+                }
+            }
+            else _seeded = true;
+
+            _prevIn = inB; _prevOut = outB; _prevTime = now;
+
+            log?.AppendLine($"  [NDIS-WMI] \"{AdapterName}\" " +
+                $"total={inB:N0}/{outB:N0} " +
+                $"IN={SystemInfoService.FormatBps(InBps)} OUT={SystemInfoService.FormatBps(OutBps)}");
         }
     }
 

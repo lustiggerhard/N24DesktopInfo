@@ -15,14 +15,20 @@ namespace N24DesktopInfo
 {
     public partial class MainWindow : Window
     {
-        private const string N24_VERSION = "1.6.1";
-        private const string N24_DATE = "2026-04-21";
+        private const string N24_VERSION = "1.7.3";
+        private const string N24_DATE = "2026-07-03";
+        // 1.7.3 (2026-07-03) - Fix: Anzeige-Freeze auf WS2019 durch blockierenden
+        //                       NDIS-WMI-Probe. Query jetzt mit Watchdog-Timeout +
+        //                       Auto-Disable, Scope wird nicht mehr jede Sekunde neu
+        //                       verbunden. Collect() kann nicht mehr dauerhaft hängen.
+        // 1.7.2 (2026-06-10) - Vorversion
 
         private AppConfig _config = null!;
         private SystemInfoService _infoService = null!;
         private DispatcherTimer _timer = null!;
         private FileSystemWatcher? _configWatcher;
         private DispatcherTimer? _reloadDebounce;
+        private bool _bodyClickThrough = true; // Body lässt Klicks zum Desktop durch; Titelzeile bleibt klickbar
 
         // Brushes
         private System.Windows.Forms.NotifyIcon? _trayIcon;
@@ -40,6 +46,8 @@ namespace N24DesktopInfo
         private Run? _rUptime, _rRamInfo, _rRamPercent, _rExternIp;
         private Run? _rCpuLoadPercent, _rTrafficIn, _rTrafficOut;
         private Rectangle? _rectCpuFill, _rectRamFill;
+        private readonly List<Rectangle> _coreFillRects = new();
+        private double _coreBarHeight, _coreBarWidth;
         private int _lastDiskCount = -1, _lastAdapterCount = -1;
         private readonly List<Run> _diskValueRuns = new(), _diskPercentRuns = new();
         private readonly List<Rectangle> _diskFillRects = new();
@@ -55,6 +63,8 @@ namespace N24DesktopInfo
         public MainWindow()
         {
             InitializeComponent();
+            // Rechtsklick auf die Titelzeile beendet das Programm
+            TitleText.MouseRightButtonUp += (_, _) => ExitApp();
             LoadConfig();
             ApplyTheme();
             InitTrayIcon();
@@ -106,6 +116,9 @@ namespace N24DesktopInfo
             FooterSeparator.Fill = _separatorBrush;
             TitleText.FontFamily = _monoFont; TitleText.FontSize = fs + 1;
             TitleText.Foreground = _titleBrush; TitleText.Text = "⚡ N24 Desktop Info";
+            TitleText.Background = Brushes.Transparent; // hit-testbar machen (für Rechtsklick = Beenden)
+            TitleText.ToolTip = "Rechtsklick = Beenden";
+            TitleText.Cursor = System.Windows.Input.Cursors.Hand;
             InfoText.FontFamily = _monoFont; InfoText.FontSize = fs;
             FooterText.FontFamily = _monoFont; FooterText.FontSize = fs - 1;
 
@@ -116,6 +129,11 @@ namespace N24DesktopInfo
 
             double pctTextPx = 40; // space for " 81%" text
             _barPixelWidth = Math.Max(50, _contentWidthPx - _labelWidthPx - pctTextPx);
+
+            _coreBarHeight = _config.Display.CoreBarHeight;
+            int perRow = Math.Max(1, _config.Display.CoreBarsPerRow);
+            const double coreGap = 4;
+            _coreBarWidth = Math.Max(20, (_contentWidthPx - _labelWidthPx - (perRow - 1) * coreGap) / perRow);
 
             ChartBorder.Width = _contentWidthPx; ChartBorder.Height = _config.Traffic.ChartHeight;
             ChartBorder.BorderBrush = _chartBorderBrush;
@@ -166,7 +184,9 @@ namespace N24DesktopInfo
             var h = new WindowInteropHelper(this).Handle;
             HwndSource.FromHwnd(h)?.AddHook(WndProc);
             int ex = NativeMethods.GetWindowLong(h, NativeMethods.GWL_EXSTYLE);
-            ex |= NativeMethods.WS_EX_TRANSPARENT | NativeMethods.WS_EX_TOOLWINDOW | NativeMethods.WS_EX_NOACTIVATE;
+            // Kein WS_EX_TRANSPARENT: Click-Through wird pro Region über WM_NCHITTEST geregelt,
+            // damit die Titelzeile (Rechtsklick = Beenden) immer anklickbar bleibt.
+            ex |= NativeMethods.WS_EX_TOOLWINDOW | NativeMethods.WS_EX_NOACTIVATE;
             ex &= ~NativeMethods.WS_EX_APPWINDOW;
             NativeMethods.SetWindowLong(h, NativeMethods.GWL_EXSTYLE, ex);
             SendToBottom(); PositionWindow();
@@ -174,6 +194,17 @@ namespace N24DesktopInfo
 
         private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
+            if (msg == NativeMethods.WM_NCHITTEST)
+            {
+                // Titelzeile immer klickbar; restlicher Body je nach Click-Through-Modus durchlässig.
+                long lp = lParam.ToInt64();
+                var screenPt = new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF));
+                int result = IsOverTitle(screenPt)
+                    ? NativeMethods.HTCLIENT
+                    : (_bodyClickThrough ? NativeMethods.HTTRANSPARENT : NativeMethods.HTCLIENT);
+                handled = true;
+                return new IntPtr(result);
+            }
             if (msg == NativeMethods.WM_WINDOWPOSCHANGING)
             {
                 var p = Marshal.PtrToStructure<NativeMethods.WINDOWPOS>(lParam);
@@ -239,9 +270,21 @@ namespace N24DesktopInfo
 
         private void SetClickThrough(bool on)
         {
-            var h = new WindowInteropHelper(this).Handle;
-            int ex = NativeMethods.GetWindowLong(h, NativeMethods.GWL_EXSTYLE);
-            NativeMethods.SetWindowLong(h, NativeMethods.GWL_EXSTYLE, on ? (ex | NativeMethods.WS_EX_TRANSPARENT) : (ex & ~NativeMethods.WS_EX_TRANSPARENT));
+            // Body-Pass-through; die Titelzeile bleibt unabhängig davon immer klickbar (siehe WM_NCHITTEST).
+            _bodyClickThrough = on;
+        }
+
+        private bool IsOverTitle(Point screenPt)
+        {
+            try
+            {
+                if (!TitleText.IsLoaded || TitleText.ActualWidth <= 0) return false;
+                var wpfPt = PointFromScreen(screenPt);
+                var t = TitleText.TransformToAncestor(this);
+                var r = t.TransformBounds(new Rect(0, 0, TitleText.ActualWidth, TitleText.ActualHeight));
+                return r.Contains(wpfPt);
+            }
+            catch { return false; }
         }
 
         private void ExitApp()
@@ -356,6 +399,7 @@ namespace N24DesktopInfo
         {
             InfoText.Inlines.Clear();
             _diskValueRuns.Clear(); _diskPercentRuns.Clear(); _diskFillRects.Clear(); _netValueRuns.Clear();
+            _coreFillRects.Clear();
             _rTrafficIn = null; _rTrafficOut = null;
 
             var sec = _config.Sections;
@@ -370,6 +414,20 @@ namespace N24DesktopInfo
                 if (data.CpuCores > 0) StaticLine("CORES", $"{data.CpuCores}C / {Environment.ProcessorCount}T");
                 Label("LOAD"); var cb = PctBrush(data.CpuUsagePercent, 75, 90);
                 _rectCpuFill = Bar(data.CpuUsagePercent, cb); _rCpuLoadPercent = DynPct(data.CpuUsagePercent, cb);
+
+                if (sec.ShowCpuPerCore && data.CpuPerCorePercent.Count > 0)
+                {
+                    BoldLabel("CORES LOAD");
+                    int perRow = Math.Max(1, _config.Display.CoreBarsPerRow);
+                    for (int i = 0; i < data.CpuPerCorePercent.Count; i++)
+                    {
+                        if (i % perRow == 0) LabelSpacer(); // Row-Anfang bündig mit den normalen Balken einrücken
+                        double pct = data.CpuPerCorePercent[i];
+                        _coreFillRects.Add(CoreBar(pct, PctBrush(pct, 75, 90)));
+                        bool endOfRow = (i + 1) % perRow == 0 || i == data.CpuPerCorePercent.Count - 1;
+                        Raw(endOfRow ? "\n" : " ", _separatorBrush);
+                    }
+                }
             }
 
             if (sec.ShowRAM)
@@ -436,6 +494,14 @@ namespace N24DesktopInfo
                 _rectCpuFill.Fill = b; _rectCpuFill.Width = Math.Max(0, _barPixelWidth * Math.Clamp(data.CpuUsagePercent, 0, 100) / 100.0);
                 if (_rCpuLoadPercent != null) { _rCpuLoadPercent.Text = $" {data.CpuUsagePercent,3:F0}%\n"; _rCpuLoadPercent.Foreground = b; }
             }
+
+            if (sec.ShowCpuPerCore)
+                for (int i = 0; i < data.CpuPerCorePercent.Count && i < _coreFillRects.Count; i++)
+                {
+                    double pct = data.CpuPerCorePercent[i];
+                    _coreFillRects[i].Fill = PctBrush(pct, 75, 90);
+                    _coreFillRects[i].Width = Math.Max(0, _coreBarWidth * Math.Clamp(pct, 0, 100) / 100.0);
+                }
 
             if (sec.ShowRAM)
             {
@@ -577,6 +643,19 @@ namespace N24DesktopInfo
             g.Children.Add(bg); g.Children.Add(fr);
             InfoText.Inlines.Add(new InlineUIContainer(new Border { BorderBrush = _barBorderBrush, BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(2), Width = _barPixelWidth, Height = _barHeight, Child = g })
+                { BaselineAlignment = BaselineAlignment.Center });
+            return fr;
+        }
+
+        private Rectangle CoreBar(double pct, SolidColorBrush fill)
+        {
+            double fw = Math.Max(0, _coreBarWidth * Math.Clamp(pct, 0, 100) / 100.0);
+            var bg = new Rectangle { Fill = _barEmptyBrush, HorizontalAlignment = HorizontalAlignment.Stretch };
+            var fr = new Rectangle { Fill = fill, Width = fw, HorizontalAlignment = HorizontalAlignment.Left };
+            var g = new Grid { Width = _coreBarWidth, Height = _coreBarHeight, ClipToBounds = true };
+            g.Children.Add(bg); g.Children.Add(fr);
+            InfoText.Inlines.Add(new InlineUIContainer(new Border { BorderBrush = _barBorderBrush, BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(2), Width = _coreBarWidth, Height = _coreBarHeight, Child = g })
                 { BaselineAlignment = BaselineAlignment.Center });
             return fr;
         }

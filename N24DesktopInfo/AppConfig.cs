@@ -69,6 +69,10 @@ namespace N24DesktopInfo
         public string BarEmptyColor { get; set; } = "#2d3561";
         public string BarBorderColor { get; set; } = "#4a5080";
         public double BarHeight { get; set; } = 12;
+        /// <summary>Balkenhöhe der Per-Core-Auslastungsbalken (Pixel).</summary>
+        public double CoreBarHeight { get; set; } = 8;
+        /// <summary>Anzahl Per-Core-Balken pro Zeile (1 = untereinander).</summary>
+        public int CoreBarsPerRow { get; set; } = 2;
         public int LabelWidth { get; set; } = 90;
         public int ValueWidth { get; set; } = 210;
         public int CornerRadius { get; set; } = 8;
@@ -88,6 +92,8 @@ namespace N24DesktopInfo
         public bool ShowOS { get; set; } = true;
         public bool ShowUptime { get; set; } = true;
         public bool ShowCPU { get; set; } = true;
+        /// <summary>Zeigt zusätzlich einen eigenen Auslastungsbalken pro logischem Core.</summary>
+        public bool ShowCpuPerCore { get; set; } = false;
         public bool ShowRAM { get; set; } = true;
         public bool ShowDisks { get; set; } = true;
         public bool ShowNetwork { get; set; } = true;

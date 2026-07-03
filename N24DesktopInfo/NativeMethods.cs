@@ -21,6 +21,11 @@ namespace N24DesktopInfo
         public const int WM_WINDOWPOSCHANGING = 0x0046;
         public const int WM_DISPLAYCHANGE     = 0x007E;
         public const int WM_SETTINGCHANGE     = 0x001A;
+        public const int WM_NCHITTEST         = 0x0084;
+
+        // Hit-Test-Ergebnisse für WM_NCHITTEST
+        public const int HTTRANSPARENT = -1;   // Klick fällt zum Fenster darunter (Desktop) durch
+        public const int HTCLIENT      = 1;    // Klick wird normal an dieses Fenster geliefert
 
         [StructLayout(LayoutKind.Sequential)]
         public struct WINDOWPOS
@@ -47,6 +52,25 @@ namespace N24DesktopInfo
 
         // === CPU ===
         [DllImport("kernel32.dll")] public static extern bool GetSystemTimes(out long idle, out long kernel, out long user);
+
+        // Per-core CPU: NtQuerySystemInformation mit SystemProcessorPerformanceInformation (Class 8).
+        // Liefert ein Array mit einem Eintrag pro logischem Prozessor.
+        public const int SystemProcessorPerformanceInformation = 8;
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION
+        {
+            public long IdleTime;       // 100ns-Ticks
+            public long KernelTime;     // enthält IdleTime
+            public long UserTime;
+            public long DpcTime;
+            public long InterruptTime;
+            public uint InterruptCount;
+        }
+
+        [DllImport("ntdll.dll")]
+        public static extern int NtQuerySystemInformation(int systemInformationClass,
+            IntPtr systemInformation, int systemInformationLength, out int returnLength);
 
         // === Icon cleanup ===
         [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr handle);
