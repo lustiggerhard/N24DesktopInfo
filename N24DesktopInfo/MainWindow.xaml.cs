@@ -15,8 +15,24 @@ namespace N24DesktopInfo
 {
     public partial class MainWindow : Window
     {
-        private const string N24_VERSION = "1.7.3";
-        private const string N24_DATE = "2026-07-03";
+        private const string N24_VERSION = "1.7.5";
+        private const string N24_DATE = "2026-07-12";
+        // 1.7.5 (2026-07-12) - Fix: Race Condition zwischen Constructor-Collect
+        //                       (Background-Thread) und Timer-Collect. Beide riefen
+        //                       Collect() auf dem nicht-threadsafen SystemInfoService
+        //                       parallel auf, wenn der erste Collect hing (WS2019).
+        //                       Timer wird jetzt via _updating bis zum ersten fertigen
+        //                       Collect blockiert; _updating nur noch UI-Thread-seitig.
+        //                       Fix: Config-Reload rief Collect() synchron auf dem
+        //                       UI-Thread auf (Freeze bei WMI-Haenger) und disposte den
+        //                       _infoService evtl. mitten im laufenden Collect. Reload
+        //                       nutzt jetzt denselben async/guarded Pfad (StartInitialCollect)
+        //                       und disposed nur bei inaktivem Collect.
+        //                       Refactor: gemeinsame RenderData()/StartInitialCollect().
+        // 1.7.4 (2026-07-12) - Fix: Constructor UpdateDisplay() auf Background-Thread;
+        //                       LoadStaticInfo() WMI-Queries mit 3s Timeout.
+        //                       Verhindert Freeze beim Start wenn WMI beim ersten
+        //                       Aufruf haengt (sporadisch auf WS2019/2022).
         // 1.7.3 (2026-07-03) - Fix: Anzeige-Freeze auf WS2019 durch blockierenden
         //                       NDIS-WMI-Probe. Query jetzt mit Watchdog-Timeout +
         //                       Auto-Disable, Scope wird nicht mehr jede Sekunde neu
@@ -70,7 +86,9 @@ namespace N24DesktopInfo
             InitTrayIcon();
             InitConfigWatcher();
             _infoService = new SystemInfoService(_config);
-            UpdateDisplay();
+            // Erster Collect auf Background-Thread - verhindert UI-Freeze wenn WMI
+            // beim Start haengt (sporadisch auf WS2019/2022).
+            StartInitialCollect();
             _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(_config.Refresh.IntervalSeconds) };
             _timer.Tick += OnTimerTick;
             _timer.Start();
@@ -164,15 +182,27 @@ namespace N24DesktopInfo
 
         private void DoReloadConfig()
         {
+            // Laeuft gerade ein Collect (Timer- oder Initial-Collect im Hintergrund),
+            // darf der noch benutzte _infoService NICHT disposed werden. Kurz spaeter
+            // erneut versuchen (Debounce-Timer nochmal anwerfen).
+            if (_updating) { _reloadDebounce?.Start(); return; }
             try
             {
                 LoadConfig(); ApplyTheme();
                 _needsRebuild = true; _lastDiskCount = -1; _lastAdapterCount = -1;
                 _timer.Interval = TimeSpan.FromSeconds(_config.Refresh.IntervalSeconds);
-                _infoService?.Dispose(); _infoService = new SystemInfoService(_config);
-                UpdateDisplay(); PositionWindow();
+
+                // Kein aktiver Collect (durch _updating-Guard oben) -> altes Service jetzt
+                // gefahrlos disposen. Dispose ist billig (HttpClient/PerfCounter), kein WMI.
+                var old = _infoService;
+                _infoService = new SystemInfoService(_config);
+                old?.Dispose();
+
+                // Erster Collect des neuen Service async + _updating-gesichert, damit ein
+                // haengender WMI-Query den UI-Thread beim Reload nicht einfriert.
+                StartInitialCollect();
             }
-            catch { }
+            catch { _updating = false; }
         }
 
         // ========================================================
@@ -354,17 +384,7 @@ namespace N24DesktopInfo
                 _errorCount = 0;
 
                 // UI update on dispatcher thread
-                bool structChanged = data.Disks.Count != _lastDiskCount || data.NetworkAdapters.Count != _lastAdapterCount;
-                if (_needsRebuild || structChanged)
-                {
-                    BuildLayout(data);
-                    _needsRebuild = false;
-                    _lastDiskCount = data.Disks.Count; _lastAdapterCount = data.NetworkAdapters.Count;
-                    Dispatcher.BeginInvoke(DispatcherPriority.Loaded, PositionWindow);
-                }
-                else RefreshValues(data);
-
-                if (_config.Sections.ShowTrafficChart) UpdateTrafficChart(data);
+                RenderData(data);
             }
             catch (Exception ex)
             {
@@ -378,11 +398,10 @@ namespace N24DesktopInfo
             }
         }
 
-        private void UpdateDisplay()
+        // Rendert einen Collect-Snapshot in die UI. MUSS auf dem UI-Thread laufen.
+        private void RenderData(SystemInfoData data)
         {
-            var data = _infoService.Collect();
             bool structChanged = data.Disks.Count != _lastDiskCount || data.NetworkAdapters.Count != _lastAdapterCount;
-
             if (_needsRebuild || structChanged)
             {
                 BuildLayout(data);
@@ -393,6 +412,27 @@ namespace N24DesktopInfo
             else RefreshValues(data);
 
             if (_config.Sections.ShowTrafficChart) UpdateTrafficChart(data);
+        }
+
+        // Erster Collect eines (neuen) SystemInfoService auf Background-Thread.
+        // _updating=true blockiert den Timer bis der Collect fertig ist: der
+        // SystemInfoService ist NICHT thread-safe, es darf nie mehr als ein
+        // Collect() gleichzeitig laufen. _updating wird nur auf dem UI-Thread
+        // gesetzt/geloescht (hier bzw. in der BeginInvoke-Continuation).
+        private void StartInitialCollect()
+        {
+            _updating = true;
+            Task.Run(() =>
+            {
+                SystemInfoData? d = null;
+                try { d = _infoService.Collect(); }
+                catch (Exception ex) { SystemInfoService.WriteDebugLog($"Initial Collect ERROR: {ex.Message}"); }
+                Dispatcher.BeginInvoke(() =>
+                {
+                    try { if (d != null) RenderData(d); }
+                    finally { _updating = false; }
+                });
+            });
         }
 
         private void BuildLayout(SystemInfoData data)

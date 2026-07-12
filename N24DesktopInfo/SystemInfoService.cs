@@ -283,9 +283,16 @@ namespace N24DesktopInfo
         private void LoadStaticInfo()
         {
             _staticInfoLoaded = true;
+            // Timeout-gesicherte WMI-Queries: ManagementObjectSearcher ohne Scope-Timeout
+            // kann auf WS2019/2022 beim ersten Aufruf minutenlang haengen.
+            // EnumerationOptions.Timeout begrenzt den Get()-Aufruf hart auf 3 Sekunden.
+            var enumOpts = new System.Management.EnumerationOptions { Timeout = TimeSpan.FromSeconds(3), ReturnImmediately = false };
+            var connOpts = new ConnectionOptions { Timeout = TimeSpan.FromSeconds(3) };
+            var scope = new ManagementScope("\\\\.\\root\\cimv2", connOpts);
             try
             {
-                using var s = new ManagementObjectSearcher("SELECT Caption, Version FROM Win32_OperatingSystem");
+                using var s = new ManagementObjectSearcher(scope,
+                    new ObjectQuery("SELECT Caption, Version FROM Win32_OperatingSystem"), enumOpts);
                 foreach (ManagementObject o in s.Get())
                 {
                     _cachedOsName = o["Caption"]?.ToString()?.Replace("Microsoft ", "") ?? "Windows";
@@ -297,7 +304,8 @@ namespace N24DesktopInfo
 
             try
             {
-                using var s = new ManagementObjectSearcher("SELECT Name, NumberOfCores FROM Win32_Processor");
+                using var s = new ManagementObjectSearcher(scope,
+                    new ObjectQuery("SELECT Name, NumberOfCores FROM Win32_Processor"), enumOpts);
                 foreach (ManagementObject o in s.Get())
                 {
                     _cachedCpuName = CleanCpuName(o["Name"]?.ToString() ?? "Unknown");
