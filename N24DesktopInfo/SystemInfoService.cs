@@ -95,6 +95,12 @@ namespace N24DesktopInfo
         private readonly TrafficSample[] _trafficHistory;
         private int _trafficHistoryIndex, _trafficHistoryCount;
 
+        // Cache fuer langsam veraenderliche Daten (Disks/Netzwerk-Adapter): nicht jede
+        // Sekunde neu abfragen. Siehe RefreshConfig.SlowInfoIntervalSeconds.
+        private List<DiskInfoData> _cachedDisks = new();
+        private List<NetworkAdapterData> _cachedAdapters = new();
+        private DateTime _lastDiskFetch = DateTime.MinValue, _lastAdapterFetch = DateTime.MinValue;
+
         public SystemInfoService(AppConfig config)
         {
             _config = config;
@@ -339,6 +345,14 @@ namespace N24DesktopInfo
 
         private void CollectDisks(SystemInfoData data)
         {
+            // Throttle: nur alle SlowInfoIntervalSeconds neu abfragen, sonst Cache.
+            // DriveInfo.TotalFreeSpace kann bei langsamen/getrennten Laufwerken blockieren.
+            if ((DateTime.Now - _lastDiskFetch).TotalSeconds < _config.Refresh.SlowInfoIntervalSeconds)
+            {
+                data.Disks = _cachedDisks;
+                return;
+            }
+            var list = new List<DiskInfoData>();
             try
             {
                 foreach (var d in DriveInfo.GetDrives())
@@ -346,14 +360,23 @@ namespace N24DesktopInfo
                     if (!d.IsReady) continue;
                     if (_config.Disk.OnlyFixedDrives && d.DriveType != DriveType.Fixed) continue;
                     double pct = d.TotalSize > 0 ? (double)(d.TotalSize - d.TotalFreeSpace) / d.TotalSize * 100.0 : 0;
-                    data.Disks.Add(new DiskInfoData(d.Name.TrimEnd('\\'), d.TotalSize, d.TotalFreeSpace, pct));
+                    list.Add(new DiskInfoData(d.Name.TrimEnd('\\'), d.TotalSize, d.TotalFreeSpace, pct));
                 }
             }
             catch { }
+            _cachedDisks = list; _lastDiskFetch = DateTime.Now;
+            data.Disks = list;
         }
 
         private void CollectNetworkAdapters(SystemInfoData data)
         {
+            // Throttle: Adapterliste/IP aendern sich praktisch nie im Sekundentakt.
+            if ((DateTime.Now - _lastAdapterFetch).TotalSeconds < _config.Refresh.SlowInfoIntervalSeconds)
+            {
+                data.NetworkAdapters = _cachedAdapters;
+                return;
+            }
+            var list = new List<NetworkAdapterData>();
             try
             {
                 var ignore = _config.Network.IgnoreAdapters;
@@ -374,10 +397,12 @@ namespace N24DesktopInfo
                         > 0              => $"{nic.Speed / 1000} Kbit",
                         _ => ""
                     };
-                    data.NetworkAdapters.Add(new NetworkAdapterData(nic.Name, ip.Address.ToString(), speed));
+                    list.Add(new NetworkAdapterData(nic.Name, ip.Address.ToString(), speed));
                 }
             }
             catch { }
+            _cachedAdapters = list; _lastAdapterFetch = DateTime.Now;
+            data.NetworkAdapters = list;
         }
 
         private void RefreshExternalIpIfNeeded()

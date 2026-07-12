@@ -84,6 +84,11 @@ namespace N24DesktopInfo
     {
         public int IntervalSeconds { get; set; } = 1;
         public int ExternalIpIntervalMinutes { get; set; } = 10;
+        /// <summary>Intervall (Sekunden) fuer langsam veraenderliche Daten (Disks,
+        /// Netzwerk-Adapter). Diese werden nicht jede Sekunde neu abgefragt, da die
+        /// Syscalls teuer sind und TotalFreeSpace bei langsamen/getrennten Laufwerken
+        /// blockieren kann. Dazwischen werden gecachte Werte weiterverwendet.</summary>
+        public int SlowInfoIntervalSeconds { get; set; } = 5;
     }
 
     public class SectionsConfig

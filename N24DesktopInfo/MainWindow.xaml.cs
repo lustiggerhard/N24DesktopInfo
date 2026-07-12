@@ -15,8 +15,15 @@ namespace N24DesktopInfo
 {
     public partial class MainWindow : Window
     {
-        private const string N24_VERSION = "1.7.5";
+        private const string N24_VERSION = "1.7.6";
         private const string N24_DATE = "2026-07-12";
+        // 1.7.6 (2026-07-12) - Perf: Disks + Netzwerk-Adapter werden nicht mehr jede
+        //                       Sekunde neu abgefragt (teure Syscalls, TotalFreeSpace
+        //                       kann blockieren), sondern nur alle SlowInfoIntervalSeconds
+        //                       (Default 5s) mit Cache dazwischen.
+        //                       Perf: Watchdog-Delay in OnTimerTick wird jetzt via
+        //                       CancellationToken abgebrochen -> keine ~5 toten 5s-Timer
+        //                       mehr pro Sekunde.
         // 1.7.5 (2026-07-12) - Fix: Race Condition zwischen Constructor-Collect
         //                       (Background-Thread) und Timer-Collect. Beide riefen
         //                       Collect() auf dem nicht-threadsafen SystemInfoService
@@ -364,7 +371,11 @@ namespace N24DesktopInfo
                     catch (Exception ex) { collectError = ex; return null; }
                 });
 
-                var completed = await Task.WhenAny(collectTask, Task.Delay(5000));
+                // Watchdog-Delay mit CancellationToken, damit er im Normalfall (Collect
+                // in wenigen ms fertig) sofort abgebrochen wird und nicht 5s als toter
+                // Timer weiterlebt - sonst haetten wir bei 1 Hz dauernd ~5 pending Timer.
+                using var watchdogCts = new System.Threading.CancellationTokenSource();
+                var completed = await Task.WhenAny(collectTask, Task.Delay(5000, watchdogCts.Token));
                 if (completed != collectTask)
                 {
                     _errorCount++;
@@ -372,6 +383,7 @@ namespace N24DesktopInfo
                         SystemInfoService.WriteDebugLog($"Collect TIMEOUT #{_errorCount}: took >5s, skipping");
                     return;
                 }
+                watchdogCts.Cancel(); // Collect fertig -> Watchdog-Timer sofort abbauen
 
                 data = collectTask.Result;
                 if (data == null)
